@@ -66,6 +66,22 @@ export const ARCHETYPES = {
         name: "Validation & Fixes",
         description: "Run tests and fix any issues",
         files: [],
+        isValidation: true,
+      },
+      {
+        id: "docker-run",
+        name: "Run in Docker",
+        description: "Package and run the application in Docker locally",
+        files: [],
+        isDeployment: true,
+      },
+      {
+        id: "azure-deploy",
+        name: "Deploy to Azure",
+        description: "Generate Bicep template and deploy to Azure Container Apps",
+        files: ["infra/main.bicep", "infra/main.bicepparam"],
+        isAzureDeployment: true,
+        optional: true,
       },
     ],
   },
@@ -123,6 +139,21 @@ export const ARCHETYPES = {
         description: "Docker Compose for running both services",
         files: ["docker-compose.yml", "README.md"],
       },
+      {
+        id: "docker-run",
+        name: "Run in Docker",
+        description: "Package and run the application in Docker locally",
+        files: [],
+        isDeployment: true,
+      },
+      {
+        id: "azure-deploy",
+        name: "Deploy to Azure",
+        description: "Generate Bicep template and deploy to Azure Container Apps",
+        files: ["infra/main.bicep", "infra/main.bicepparam"],
+        isAzureDeployment: true,
+        optional: true,
+      },
     ],
   },
 
@@ -172,6 +203,22 @@ export const ARCHETYPES = {
         name: "Validation & Fixes",
         description: "Run tests and fix any issues",
         files: [],
+        isValidation: true,
+      },
+      {
+        id: "docker-run",
+        name: "Run in Docker",
+        description: "Package and run the application in Docker locally",
+        files: [],
+        isDeployment: true,
+      },
+      {
+        id: "azure-deploy",
+        name: "Deploy to Azure",
+        description: "Generate Bicep template and deploy to Azure Container Apps",
+        files: ["infra/main.bicep", "infra/main.bicepparam"],
+        isAzureDeployment: true,
+        optional: true,
       },
     ],
   },
@@ -364,19 +411,47 @@ export class Orchestrator {
       const result = await this.executePhase(phase);
       
       phase.status = "completed";
-      phase.files = result.files;
+      phase.files = result.files || [];
       phase.result = result;
-      this.state.generatedFiles.push(...result.files);
+      if (result.files) {
+        this.state.generatedFiles.push(...result.files);
+      }
 
-      this.emit("phase_complete", {
-        phase,
-        phaseIndex,
-        files: result.files,
-        summary: result.summary,
-      });
+      // Emit special events for deployment phases
+      if (result.requiresDeployment && result.deploymentType === "docker") {
+        this.emit("docker_deploy_ready", {
+          phase,
+          phaseIndex,
+          workspaceDir: this.workspaceDir,
+        });
+      } else if (result.requiresDeployment && result.deploymentType === "azure") {
+        this.emit("azure_deploy_ready", {
+          phase,
+          phaseIndex,
+          workspaceDir: this.workspaceDir,
+          files: result.files,
+        });
+      } else if (result.requiresValidation) {
+        this.emit("validation_ready", {
+          phase,
+          phaseIndex,
+          workspaceDir: this.workspaceDir,
+        });
+      } else {
+        this.emit("phase_complete", {
+          phase,
+          phaseIndex,
+          files: result.files,
+          summary: result.summary,
+        });
+      }
 
-      // Automatically propose the next phase
-      return await this.proposeNextPhase();
+      // Automatically propose the next phase (unless deployment is in progress)
+      if (!result.requiresDeployment && !result.requiresValidation) {
+        return await this.proposeNextPhase();
+      }
+      
+      return result;
 
     } catch (error) {
       phase.status = "error";
@@ -391,6 +466,23 @@ export class Orchestrator {
 
       throw error;
     }
+  }
+
+  /**
+   * Mark current deployment phase as complete and propose next
+   */
+  async completeDeploymentPhase(phaseIndex, deploymentResult) {
+    const phase = this.state.phases[phaseIndex];
+    
+    this.emit("phase_complete", {
+      phase,
+      phaseIndex,
+      files: phase.files || [],
+      summary: deploymentResult.summary || "Deployment completed",
+      deploymentResult,
+    });
+    
+    return await this.proposeNextPhase();
   }
 
   /**
@@ -412,6 +504,19 @@ export class Orchestrator {
    * Execute a single phase - generates files for that phase
    */
   async executePhase(phase) {
+    // Handle special deployment phases
+    if (phase.isDeployment) {
+      return await this.executeDockerDeployment(phase);
+    }
+    
+    if (phase.isAzureDeployment) {
+      return await this.executeAzureDeployment(phase);
+    }
+    
+    if (phase.isValidation) {
+      return await this.executeValidation(phase);
+    }
+
     const archetype = ARCHETYPES[this.state.archetype];
     
     // Build phase-specific prompt
@@ -428,6 +533,7 @@ export class Orchestrator {
       attachment: this.state.attachment,
       onLog: (text) => this.emit("log", { text }),
       onFileWrite: (file) => this.emit("file", file),
+      onTrace: (text, level) => this.emit("console_trace", { text, level }),
     });
 
     // Validate the generated files
@@ -437,6 +543,119 @@ export class Orchestrator {
     }
 
     return result;
+  }
+
+  /**
+   * Execute Docker deployment phase
+   */
+  async executeDockerDeployment(phase) {
+    this.emit("log", { text: "\n🐳 Packaging and running application in Docker...\n" });
+    
+    // This will be handled by the server's deployment logic
+    // Return a special result that tells the server to deploy
+    return {
+      success: true,
+      files: [],
+      summary: "Docker deployment initiated",
+      deploymentType: "docker",
+      requiresDeployment: true,
+    };
+  }
+
+  /**
+   * Execute Azure deployment phase
+   */
+  async executeAzureDeployment(phase) {
+    this.emit("log", { text: "\n☁️ Preparing Azure deployment...\n" });
+    this.emit("console_trace", { text: "Starting Azure infrastructure generation", level: "info" });
+    
+    const archetype = ARCHETYPES[this.state.archetype];
+    
+    // Generate Bicep template using Copilot SDK
+    const bicepPrompt = this.buildAzureBicepPrompt(archetype);
+    
+    const result = await generatePhaseWithCopilot({
+      prompt: bicepPrompt,
+      workspaceDir: this.workspaceDir,
+      phase: phase,
+      archetype: this.state.archetype,
+      previousPhases: this.state.phases.filter(p => p.status === "completed"),
+      userPrompt: this.state.userPrompt,
+      attachment: this.state.attachment,
+      onLog: (text) => this.emit("log", { text }),
+      onFileWrite: (file) => this.emit("file", file),
+      onTrace: (text, level) => this.emit("console_trace", { text, level }),
+    });
+    
+    result.deploymentType = "azure";
+    result.requiresDeployment = true;
+    
+    return result;
+  }
+
+  /**
+   * Execute validation phase - run tests
+   */
+  async executeValidation(phase) {
+    this.emit("log", { text: "\n🧪 Running tests to validate generated code...\n" });
+    this.emit("console_trace", { text: "Initiating validation phase", level: "info" });
+    
+    // This will be handled by the server's test logic
+    return {
+      success: true,
+      files: [],
+      summary: "Validation initiated",
+      deploymentType: "validation",
+      requiresValidation: true,
+    };
+  }
+
+  /**
+   * Build prompt for generating Azure Bicep templates
+   */
+  buildAzureBicepPrompt(archetype) {
+    const projectName = path.basename(this.workspaceDir).replace(/_/g, "-");
+    
+    return `Generate Azure Bicep infrastructure-as-code templates to deploy this ${archetype?.name || "application"} to Azure.
+
+PROJECT: ${projectName}
+WORKSPACE: ${this.workspaceDir}
+
+USER REQUIREMENTS:
+${this.state.userPrompt}
+
+INFRASTRUCTURE REQUIREMENTS:
+Create Bicep templates that deploy the application to Azure Container Apps with the following:
+
+1. Create infra/main.bicep with:
+   - Azure Container Registry (ACR) to store the Docker image
+   - Azure Container App Environment
+   - Azure Container App running the application
+   - Azure Log Analytics Workspace for monitoring
+   - Proper networking and security settings
+   - Environment variables for configuration
+
+2. Create infra/main.bicepparam with:
+   - Parameter values for the deployment
+   - Location set to 'eastus' by default
+   - Resource naming based on project: ${projectName}
+
+3. Create a Dockerfile in the project root (if not exists) that:
+   - Uses Python 3.11 slim image
+   - Installs dependencies from requirements.txt
+   - Runs uvicorn on port 8000
+
+4. Create deploy.sh (bash script) that:
+   - Logs into Azure (az login)
+   - Creates a resource group
+   - Builds and pushes Docker image to ACR
+   - Deploys using az deployment group create with Bicep
+
+CRITICAL:
+- Use write_file for each file
+- Make the Bicep template production-ready
+- Include proper RBAC and managed identity
+- Set sensible defaults for SKUs (consumption tier for Container Apps)`;
   }
 
   /**

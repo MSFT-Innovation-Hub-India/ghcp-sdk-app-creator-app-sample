@@ -198,15 +198,27 @@ export async function generatePhaseWithCopilot({
   attachment,
   onLog,
   onFileWrite,
+  onTrace,
 }) {
   const client = await getClient();
 
-  // Create tools
-  const fileWriterTool = createFileWriterTool(workspaceDir, onFileWrite);
+  onLog?.(`\n🔧 Starting phase: ${phase.name}\n`);
+  onTrace?.(`Initializing Copilot session for phase: ${phase.name}`, 'info');
+
+  let responseContent = "";
+  const generatedFiles = [];
+
+  // Track file writes - wrap the callback to collect files
+  const trackingFileWrite = (file) => {
+    generatedFiles.push(file.path);
+    onFileWrite?.(file);
+    onTrace?.(`File written: ${file.path}`, 'success');
+  };
+
+  // Create tools with tracking enabled from the start
+  const fileWriterTool = createFileWriterTool(workspaceDir, trackingFileWrite);
   const fileReaderTool = createFileReaderTool(workspaceDir);
   const fileListTool = createFileListTool(workspaceDir);
-
-  onLog?.(`\n🔧 Starting phase: ${phase.name}\n`);
 
   // Create session
   const session = await client.createSession({
@@ -216,25 +228,10 @@ export async function generatePhaseWithCopilot({
     systemMessage: {
       content: buildSystemMessage(phase, archetype),
     },
-    timeout: 180000, // 3 minutes per phase
+    timeout: 300000, // 5 minutes per phase
   });
 
-  let responseContent = "";
-  const generatedFiles = [];
-
-  // Track file writes
-  const originalOnFileWrite = onFileWrite;
-  const trackingFileWrite = (file) => {
-    generatedFiles.push(file.path);
-    originalOnFileWrite?.(file);
-  };
-
-  // Update the tool with tracking
-  session.tools = [
-    createFileWriterTool(workspaceDir, trackingFileWrite),
-    fileReaderTool,
-    fileListTool,
-  ];
+  onTrace?.(`Session created with model: gpt-4.1`, 'debug');
 
   // Set up event listeners
   session.on((event) => {
@@ -244,26 +241,31 @@ export async function generatePhaseWithCopilot({
     }
     if (event.type === "tool.call") {
       onLog?.(`\n📄 [${event.data.name}] `);
+      onTrace?.(`Tool call: ${event.data.name}`, 'info');
     }
     if (event.type === "tool.result") {
-      // Extract file path from result if it's a write_file call
-      try {
-        const result = JSON.parse(event.data.result);
-        if (result.path) {
-          generatedFiles.push(result.path);
-          onLog?.(`created: ${result.path}\n`);
-        }
-      } catch {
-        // Ignore parse errors
-      }
+      onTrace?.(`Tool result received`, 'debug');
+    }
+    if (event.type === "stream.start") {
+      onTrace?.(`Stream started`, 'debug');
+    }
+    if (event.type === "stream.end") {
+      onTrace?.(`Stream ended`, 'debug');
+    }
+    if (event.type === "error") {
+      onTrace?.(`Error: ${event.data?.message || 'Unknown error'}`, 'error');
     }
   });
 
   try {
-    await session.sendAndWait({ prompt }, 180000); // 3 minute timeout
+    onTrace?.(`Sending prompt to Copilot SDK...`, 'info');
+    // 5 minute timeout for complex phases
+    await session.sendAndWait({ prompt }, 300000);
+    onTrace?.(`Copilot response complete`, 'success');
 
     // Deduplicate files
     const uniqueFiles = [...new Set(generatedFiles)];
+    onTrace?.(`Phase complete: ${uniqueFiles.length} files generated`, 'success');
 
     return {
       success: true,
@@ -271,7 +273,22 @@ export async function generatePhaseWithCopilot({
       summary: responseContent,
     };
   } catch (error) {
+    // If timeout, return partial results if we have any files
+    if (error.message?.includes('Timeout') && generatedFiles.length > 0) {
+      onLog?.(`\n⚠️ Phase timed out but ${generatedFiles.length} files were created\n`);
+      onTrace?.(`Phase timed out with ${generatedFiles.length} files created`, 'warn');
+      
+      const uniqueFiles = [...new Set(generatedFiles)];
+      return {
+        success: true,
+        partial: true,
+        files: uniqueFiles,
+        summary: responseContent || "Phase completed with partial results due to timeout",
+      };
+    }
+    
     onLog?.(`\n❌ Phase failed: ${error.message}\n`);
+    onTrace?.(`Phase failed: ${error.message}`, 'error');
     throw error;
   }
 }

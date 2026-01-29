@@ -353,11 +353,69 @@
     .log-pane {
       display: flex;
       flex-direction: column;
+      gap: 1rem;
     }
     
     .log-pane .log-output {
       flex: 1;
+      min-height: 250px;
+      max-height: 350px;
     }
+    
+    /* Console Trace Section */
+    .console-section {
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+      padding-top: 0.75rem;
+    }
+    
+    .console-section h4 {
+      margin-bottom: 0.5rem;
+      font-size: 0.9rem;
+      color: #888;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    
+    .console-section h4 .indicator {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #4CAF50;
+      animation: pulse-green 2s infinite;
+    }
+    
+    @keyframes pulse-green {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    
+    .console-output {
+      background: #000;
+      border-radius: 6px;
+      padding: 0.75rem;
+      height: 150px;
+      max-height: 200px;
+      overflow-y: auto;
+      font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+      font-size: 0.75rem;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #00ff00;
+      border: 1px solid #333;
+    }
+    
+    .console-output .trace-line {
+      display: block;
+      opacity: 0.9;
+    }
+    
+    .console-output .trace-line.info { color: #64B5F6; }
+    .console-output .trace-line.warn { color: #FFB74D; }
+    .console-output .trace-line.error { color: #EF5350; }
+    .console-output .trace-line.debug { color: #888; }
+    .console-output .trace-line.success { color: #81C784; }
     
     /* Generated Files List */
     .file-list {
@@ -556,6 +614,12 @@ Example: A task management API with user authentication, projects, tasks with pr
         <div class="log-pane">
           <h3>📜 Live Execution Log</h3>
           <div class="log-output" id="log-output"></div>
+          
+          <!-- Console Trace Section -->
+          <div class="console-section">
+            <h4><span class="indicator" id="console-indicator"></span> Console Trace</h4>
+            <div class="console-output" id="console-trace"></div>
+          </div>
         </div>
       </div>
     </section>
@@ -588,6 +652,8 @@ Example: A task management API with user authentication, projects, tasks with pr
     const archetypeGrid = document.getElementById('archetype-grid');
     const phaseList = document.getElementById('phase-list');
     const logOutput = document.getElementById('log-output');
+    const consoleTrace = document.getElementById('console-trace');
+    const consoleIndicator = document.getElementById('console-indicator');
     const confirmationBanner = document.getElementById('confirmation-banner');
     
     // Initialize
@@ -706,6 +772,7 @@ Example: A task management API with user authentication, projects, tasks with pr
       goToStep(3);
       logOutput.textContent = '';
       phaseList.innerHTML = '';
+      clearConsoleTrace();
       
       // Reset file list
       allGeneratedFiles.clear();
@@ -785,12 +852,42 @@ Example: A task management API with user authentication, projects, tasks with pr
       eventSource.addEventListener('log', (e) => {
         const data = JSON.parse(e.data);
         appendLog(data.text);
+        // Also stream to console trace with debug level
+        appendConsoleTrace(data.text, 'debug');
+      });
+      
+      eventSource.addEventListener('console_trace', (e) => {
+        const data = JSON.parse(e.data);
+        appendConsoleTrace(data.text, data.level || 'info');
       });
       
       eventSource.addEventListener('file', (e) => {
         const data = JSON.parse(e.data);
         addFilesToList([data.path]);
         appendLog(`📄 [FILE] ${data.action}: ${data.path}\n`);
+        appendConsoleTrace(`[FILE] ${data.action}: ${data.path}`, 'success');
+      });
+      
+      eventSource.addEventListener('docker_deployed', (e) => {
+        const data = JSON.parse(e.data);
+        appendLog(`\n🎉 Docker deployment successful!\n`);
+        appendLog(`🌐 Application URL: ${data.url}\n`);
+        appendLog(`📦 Container: ${data.containerName}\n\n`);
+        
+        // Show the deployment URL in the UI
+        showDeploymentLink('docker', data.url, data.containerName);
+      });
+      
+      eventSource.addEventListener('azure_deployed', (e) => {
+        const data = JSON.parse(e.data);
+        appendLog(`\n☁️ Azure deployment successful!\n`);
+        if (data.url) {
+          appendLog(`🌐 Application URL: ${data.url}\n`);
+        }
+        appendLog(`📦 Resource Group: ${data.resourceGroup}\n\n`);
+        
+        // Show the deployment URL in the UI
+        showDeploymentLink('azure', data.url, data.resourceGroup);
       });
       
       eventSource.addEventListener('completed', (e) => {
@@ -936,6 +1033,103 @@ Example: A task management API with user authentication, projects, tasks with pr
     function appendLog(text) {
       logOutput.textContent += text;
       logOutput.scrollTop = logOutput.scrollHeight;
+    }
+    
+    // Append to console trace with timestamp and level
+    let traceLineCount = 0;
+    const MAX_TRACE_LINES = 200;
+    
+    function appendConsoleTrace(text, level = 'info') {
+      if (!consoleTrace) return;
+      
+      // Pulse the indicator to show activity
+      if (consoleIndicator) {
+        consoleIndicator.style.animation = 'none';
+        consoleIndicator.offsetHeight; // Force reflow
+        consoleIndicator.style.animation = 'pulse-green 0.3s ease-out';
+      }
+      
+      // Format timestamp
+      const now = new Date();
+      const timestamp = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0');
+      
+      // Clean up text - remove excessive newlines
+      const cleanText = text.replace(/^\n+|\n+$/g, '').replace(/\n{3,}/g, '\n\n');
+      if (!cleanText.trim()) return;
+      
+      // Create trace line
+      const line = document.createElement('span');
+      line.className = `trace-line ${level}`;
+      line.textContent = `[${timestamp}] ${cleanText}\n`;
+      
+      consoleTrace.appendChild(line);
+      traceLineCount++;
+      
+      // Keep trace buffer manageable
+      while (traceLineCount > MAX_TRACE_LINES && consoleTrace.firstChild) {
+        consoleTrace.removeChild(consoleTrace.firstChild);
+        traceLineCount--;
+      }
+      
+      // Auto-scroll to bottom
+      consoleTrace.scrollTop = consoleTrace.scrollHeight;
+    }
+    
+    // Clear console trace when starting new job
+    function clearConsoleTrace() {
+      if (consoleTrace) {
+        consoleTrace.innerHTML = '';
+        traceLineCount = 0;
+      }
+    }
+    
+    // Show deployment link in the UI
+    let deploymentLinks = { docker: null, azure: null };
+    
+    function showDeploymentLink(type, url, resource) {
+      deploymentLinks[type] = { url, resource };
+      
+      // Find or create the deployment links container
+      let linksContainer = document.getElementById('deployment-links');
+      if (!linksContainer) {
+        linksContainer = document.createElement('div');
+        linksContainer.id = 'deployment-links';
+        linksContainer.style.cssText = `
+          margin-top: 1rem;
+          padding: 1rem;
+          background: rgba(76, 175, 80, 0.1);
+          border-radius: 8px;
+          border: 1px solid #4CAF50;
+        `;
+        linksContainer.innerHTML = '<h3 style="color: #4CAF50; margin-bottom: 0.75rem;">🚀 Deployed Applications</h3><div id="links-list"></div>';
+        
+        // Insert before the log output
+        const logSection = document.querySelector('#section-generate .generation-pane:last-child');
+        if (logSection) {
+          logSection.insertBefore(linksContainer, logOutput.parentElement);
+        }
+      }
+      
+      const linksList = document.getElementById('links-list');
+      const existingLink = document.getElementById(`link-${type}`);
+      
+      const linkHtml = type === 'docker' 
+        ? `<div id="link-docker" style="margin-bottom: 0.5rem;">
+            🐳 <strong>Docker:</strong> 
+            ${url ? `<a href="${url}" target="_blank" style="color: #64B5F6;">${url}</a>` : '(deploying...)'}
+            <span style="color: #888; margin-left: 0.5rem;">[${resource}]</span>
+          </div>`
+        : `<div id="link-azure" style="margin-bottom: 0.5rem;">
+            ☁️ <strong>Azure:</strong> 
+            ${url ? `<a href="${url}" target="_blank" style="color: #64B5F6;">${url}</a>` : '(see resource group)'}
+            <span style="color: #888; margin-left: 0.5rem;">[${resource}]</span>
+          </div>`;
+      
+      if (existingLink) {
+        existingLink.outerHTML = linkHtml;
+      } else {
+        linksList.innerHTML += linkHtml;
+      }
     }
   </script>
 </body>

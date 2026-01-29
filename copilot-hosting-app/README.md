@@ -111,6 +111,158 @@ flowchart TB
 
 ---
 
+## Execution Architecture: Where Does Code Actually Run?
+
+Understanding where things execute is crucial for debugging and understanding the system.
+
+### Execution Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           YOUR MACHINE                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────┐      ┌─────────────────────┐                          │
+│  │  Node.js Server  │      │  GitHub Copilot SDK │                          │
+│  │   (index.js)     │◄────►│  (via stdio/API)    │                          │
+│  └────────┬─────────┘      └─────────────────────┘                          │
+│           │                         │                                        │
+│           │ "Generate code"         │ Returns generated code                 │
+│           │                         │ + tool calls (write_file, etc.)        │
+│           │                         ▼                                        │
+│           │              ┌─────────────────────┐                            │
+│           │              │  phase_generator.js │ ◄── Copilot generates here │
+│           │              │  (tool handlers)    │     but it's just TEXT     │
+│           │              └─────────────────────┘                            │
+│           │                                                                  │
+│           │ "Run tests" / "Deploy"                                          │
+│           ▼                                                                  │
+│  ┌──────────────────┐                                                       │
+│  │  docker_runner.js │ ◄── spawn("docker", [...])                           │
+│  │                   │     Uses child_process.spawn()                        │
+│  └────────┬──────────┘                                                       │
+│           │                                                                  │
+│           │ docker run py-runner bash -c "pip install...; pytest -v"        │
+│           ▼                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │                     DOCKER CONTAINER (py-runner)                   │     │
+│  │  ┌─────────────────────────────────────────────────────────────┐  │     │
+│  │  │  /workspace  (mounted from your workspaces/xxx folder)      │  │     │
+│  │  │                                                              │  │     │
+│  │  │  $ pip install fastapi pytest httpx...                       │  │     │
+│  │  │  $ pytest -v                                                 │  │     │
+│  │  │                                                              │  │     │
+│  │  │  STDOUT/STDERR ──┬──► p.stdout.on("data") ──► onLog()       │  │     │
+│  │  │                  │                                          │  │     │
+│  │  │  Stack traces    │                                          │  │     │
+│  │  │  Test results    ┘                                          │  │     │
+│  │  └─────────────────────────────────────────────────────────────┘  │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Component Responsibilities
+
+| Component | What It Does | Where It Runs |
+|-----------|--------------|---------------|
+| **Express Server** (`index.js`) | HTTP endpoints, SSE streaming, job management | Node.js on your machine |
+| **Orchestrator** (`orchestrator.js`) | Phase management, archetype selection, confirmation flow | Node.js on your machine |
+| **Phase Generator** (`phase_generator.js`) | Copilot SDK calls, tool definitions (write_file, etc.) | Node.js on your machine |
+| **Copilot SDK** (`@github/copilot-sdk`) | JSON-RPC communication with Copilot CLI | Node.js subprocess |
+| **Copilot CLI** (`@github/copilot`) | Agent runtime, sends prompts to GitHub API | CLI subprocess |
+| **GitHub Copilot Service** | LLM inference (GPT-4.1, etc.) | GitHub's cloud |
+| **Docker Runner** (`docker_runner.js`) | Spawns Docker containers for tests/deployment | Node.js → Docker |
+| **py-runner Container** | Actually executes pytest, uvicorn, pip install | Inside Docker |
+
+### Key Insight: Code Generation vs. Code Execution
+
+```mermaid
+flowchart LR
+    subgraph Generation["📝 CODE GENERATION"]
+        direction TB
+        SDK["Copilot SDK"]
+        LLM["LLM (GPT-4.1)"]
+        Tools["Tool Handlers<br/>(write_file)"]
+        
+        SDK --> LLM
+        LLM --> Tools
+        Tools -->|"fs.writeFileSync()"| Files["Files on disk"]
+    end
+    
+    subgraph Execution["🚀 CODE EXECUTION"]
+        direction TB
+        Docker["Docker Runner"]
+        Container["py-runner Container"]
+        Pytest["pytest / uvicorn"]
+        
+        Docker --> Container
+        Container --> Pytest
+    end
+    
+    Generation -->|"Files created"| Execution
+    
+    style Generation fill:#dbeafe,stroke:#2563eb
+    style Execution fill:#fef3c7,stroke:#d97706
+```
+
+### Where Do Stack Traces Come From?
+
+1. **Copilot SDK** - Only generates code as **TEXT**. It doesn't execute anything.
+
+2. **`docker_runner.js`** - Uses Node's `child_process.spawn("docker", ...)` to run commands. Output is captured via:
+   ```javascript
+   p.stdout?.on("data", (d) => {
+     onLog?.({ stream: "stdout", text: d.toString() });
+   });
+   p.stderr?.on("data", (d) => {
+     onLog?.({ stream: "stderr", text: d.toString() });
+   });
+   ```
+
+3. **Actual pytest/app execution** happens **INSIDE the Docker container**. You don't see it in your Windows terminal because it's running in a subprocess that pipes output back to Node.js, which then broadcasts it via SSE to the UI.
+
+### Console Output Flow
+
+```
+Docker Container                Node.js Server                Browser UI
+────────────────               ────────────────              ───────────
+pytest -v                      
+ │                             
+ ├─► STDOUT "test_create PASSED"
+ │         │                   
+ │         └──► p.stdout.on("data")
+ │                    │
+ │                    └──► broadcastEvent(jobId, "log", {text})
+ │                                      │
+ │                                      └──► SSE: event.data
+ │                                                   │
+ │                                                   └──► appendLog(text)
+ │                                                        appendConsoleTrace(text)
+ │
+ ├─► STDERR "ImportError: ..."  
+ │         │
+ │         └──► Same flow as above
+```
+
+### Why You Don't See Output in Your Terminal
+
+The Docker process runs as a **child process** of Node.js:
+
+```javascript
+// In docker_runner.js
+const p = spawn("docker", ["run", ...args]);
+
+// Output goes to event handlers, NOT to your console
+p.stdout.on("data", (d) => onLog({ text: d.toString() }));
+```
+
+To see raw Docker output in your terminal, you would need to:
+1. Run `docker logs <container-name>` manually
+2. Or add `console.log(d.toString())` to the spawn handlers
+
+---
+
 ## How It Works
 
 ### Step-by-Step Flow

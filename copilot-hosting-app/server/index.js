@@ -164,8 +164,25 @@ async function startOrchestration(jobId) {
 
   job.status = "running";
 
-  // Create orchestrator with event emitter
-  const orchestrator = createOrchestrator(job.projectDir, (event) => {
+  // Create orchestrator with event emitter that handles special deployment events
+  const orchestrator = createOrchestrator(job.projectDir, async (event) => {
+    // Handle special deployment events
+    if (event.type === "docker_deploy_ready") {
+      await handleDockerDeployment(jobId, event.data);
+      return;
+    }
+    
+    if (event.type === "azure_deploy_ready") {
+      await handleAzureDeployment(jobId, event.data);
+      return;
+    }
+    
+    if (event.type === "validation_ready") {
+      await handleValidation(jobId, event.data);
+      return;
+    }
+    
+    // Forward other events to clients
     broadcastEvent(jobId, event.type, event.data);
   });
 
@@ -203,6 +220,324 @@ async function startOrchestration(jobId) {
     await orchestrator.proposeNextPhase();
   } catch (error) {
     broadcastEvent(jobId, "error", { message: error.message });
+  }
+}
+
+/**
+ * Handle Docker deployment - runs the app in a Docker container
+ */
+async function handleDockerDeployment(jobId, eventData) {
+  const job = activeJobs.get(jobId);
+  if (!job) return;
+  
+  const { phaseIndex, workspaceDir } = eventData;
+  
+  broadcastEvent(jobId, "log", { text: "\n🐳 Starting Docker deployment...\n" });
+  broadcastEvent(jobId, "console_trace", { text: "Initializing Docker deployment", level: "info" });
+  
+  try {
+    // Read requirements.txt for dependencies
+    const reqPath = path.join(workspaceDir, "requirements.txt");
+    let deps = ["fastapi", "uvicorn", "python-multipart"];
+    broadcastEvent(jobId, "console_trace", { text: `Reading dependencies from ${reqPath}`, level: "debug" });
+    
+    if (fs.existsSync(reqPath)) {
+      const content = fs.readFileSync(reqPath, "utf8");
+      deps = content
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"))
+        .map((l) => l.split(/[=<>]/)[0].trim())
+        .filter(Boolean);
+      broadcastEvent(jobId, "console_trace", { text: `Found ${deps.length} dependencies`, level: "info" });
+    }
+
+    const port = nextAppPort++;
+    broadcastEvent(jobId, "log", { text: `📦 Deploying to port ${port}...\n` });
+    broadcastEvent(jobId, "console_trace", { text: `Allocated port: ${port}`, level: "info" });
+
+    const deployResult = await startAppInDocker({
+      workspaceHostPath: workspaceDir,
+      deps,
+      startCommand: "uvicorn app.main:app --host 0.0.0.0 --port 8000",
+      port,
+      onLog: (x) => {
+        broadcastEvent(jobId, "log", x);
+        // Also stream to console trace
+        if (x.text) {
+          broadcastEvent(jobId, "console_trace", { text: x.text.trim(), level: "debug" });
+        }
+      },
+    });
+
+    if (deployResult.success) {
+      job.deployedUrl = deployResult.url;
+      job.containerName = deployResult.containerName;
+      
+      broadcastEvent(jobId, "log", { text: `\n✅ Application deployed successfully!\n` });
+      broadcastEvent(jobId, "log", { text: `🌐 URL: ${deployResult.url}\n` });
+      broadcastEvent(jobId, "log", { text: `📦 Container: ${deployResult.containerName}\n` });
+      broadcastEvent(jobId, "console_trace", { text: `Container started: ${deployResult.containerName}`, level: "success" });
+      broadcastEvent(jobId, "console_trace", { text: `Application URL: ${deployResult.url}`, level: "success" });
+      
+      broadcastEvent(jobId, "docker_deployed", {
+        url: deployResult.url,
+        containerName: deployResult.containerName,
+        port,
+      });
+      
+      // Complete the deployment phase and propose next
+      await job.orchestrator.completeDeploymentPhase(phaseIndex, {
+        summary: `Application running at ${deployResult.url}`,
+        url: deployResult.url,
+        containerName: deployResult.containerName,
+      });
+    } else {
+      broadcastEvent(jobId, "log", { text: `\n❌ Docker deployment failed: ${deployResult.error}\n` });
+      broadcastEvent(jobId, "console_trace", { text: `Deployment failed: ${deployResult.error}`, level: "error" });
+      broadcastEvent(jobId, "phase_error", {
+        phase: eventData.phase,
+        phaseIndex,
+        error: deployResult.error,
+      });
+    }
+  } catch (error) {
+    broadcastEvent(jobId, "log", { text: `\n❌ Error: ${error.message}\n` });
+    broadcastEvent(jobId, "console_trace", { text: `Error: ${error.message}`, level: "error" });
+    broadcastEvent(jobId, "phase_error", {
+      phase: eventData.phase,
+      phaseIndex,
+      error: error.message,
+    });
+  }
+}
+
+/**
+ * Handle validation - run tests in Docker
+ */
+async function handleValidation(jobId, eventData) {
+  const job = activeJobs.get(jobId);
+  if (!job) return;
+  
+  const { phaseIndex, workspaceDir } = eventData;
+  
+  broadcastEvent(jobId, "log", { text: "\n🧪 Running tests...\n" });
+  broadcastEvent(jobId, "console_trace", { text: "Starting test execution", level: "info" });
+  
+  try {
+    // Read requirements.txt for dependencies
+    const reqPath = path.join(workspaceDir, "requirements.txt");
+    let deps = ["fastapi", "uvicorn", "pytest", "httpx", "python-multipart"];
+    broadcastEvent(jobId, "console_trace", { text: "Reading test dependencies", level: "debug" });
+    
+    if (fs.existsSync(reqPath)) {
+      const content = fs.readFileSync(reqPath, "utf8");
+      deps = content
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"))
+        .map((l) => l.split(/[=<>]/)[0].trim())
+        .filter(Boolean);
+    }
+
+    const bootstrapScript = `set -e; pip install -q ${deps.join(" ")}; pytest -v`;
+    broadcastEvent(jobId, "console_trace", { text: `Running: pytest -v`, level: "info" });
+
+    const result = await dockerRunCommand({
+      workspaceHostPath: workspaceDir,
+      command: ["bash", "-c", bootstrapScript],
+      onLog: (x) => {
+        broadcastEvent(jobId, "log", x);
+        if (x.text) {
+          // Detect test status from pytest output
+          const text = x.text.trim();
+          if (text.includes('PASSED')) {
+            broadcastEvent(jobId, "console_trace", { text, level: "success" });
+          } else if (text.includes('FAILED') || text.includes('ERROR')) {
+            broadcastEvent(jobId, "console_trace", { text, level: "error" });
+          } else if (text) {
+            broadcastEvent(jobId, "console_trace", { text, level: "debug" });
+          }
+        }
+      },
+    });
+
+    if (result.code === 0) {
+      broadcastEvent(jobId, "log", { text: `\n✅ All tests passed!\n` });
+      broadcastEvent(jobId, "console_trace", { text: "All tests passed!", level: "success" });
+      await job.orchestrator.completeDeploymentPhase(phaseIndex, {
+        summary: "All tests passed",
+        testsPassed: true,
+      });
+    } else {
+      broadcastEvent(jobId, "log", { text: `\n⚠️ Some tests failed. Review the output above.\n` });
+      broadcastEvent(jobId, "console_trace", { text: "Some tests failed", level: "warn" });
+      // Still complete the phase but mark it
+      await job.orchestrator.completeDeploymentPhase(phaseIndex, {
+        summary: "Tests completed with failures",
+        testsPassed: false,
+      });
+    }
+  } catch (error) {
+    broadcastEvent(jobId, "log", { text: `\n❌ Error running tests: ${error.message}\n` });
+    broadcastEvent(jobId, "console_trace", { text: `Test error: ${error.message}`, level: "error" });
+    broadcastEvent(jobId, "phase_error", {
+      phase: eventData.phase,
+      phaseIndex,
+      error: error.message,
+    });
+  }
+}
+
+/**
+ * Handle Azure deployment - deploy to Azure Container Apps
+ */
+async function handleAzureDeployment(jobId, eventData) {
+  const job = activeJobs.get(jobId);
+  if (!job) return;
+  
+  const { phaseIndex, workspaceDir, files } = eventData;
+  
+  broadcastEvent(jobId, "log", { text: "\n☁️ Starting Azure deployment...\n" });
+  
+  try {
+    // Check if Azure CLI is available
+    const azCheck = await new Promise((resolve) => {
+      const p = require("child_process").spawn("az", ["--version"], { shell: true });
+      p.on("close", (code) => resolve(code === 0));
+      p.on("error", () => resolve(false));
+    });
+    
+    if (!azCheck) {
+      broadcastEvent(jobId, "log", { text: "\n⚠️ Azure CLI not found. Please install it and run 'az login'.\n" });
+      broadcastEvent(jobId, "log", { text: "📋 Bicep templates have been generated in the 'infra' folder.\n" });
+      broadcastEvent(jobId, "log", { text: "\nTo deploy manually:\n" });
+      broadcastEvent(jobId, "log", { text: "  1. az login\n" });
+      broadcastEvent(jobId, "log", { text: "  2. az group create --name <rg-name> --location eastus\n" });
+      broadcastEvent(jobId, "log", { text: "  3. az deployment group create --resource-group <rg-name> --template-file infra/main.bicep\n" });
+      
+      await job.orchestrator.completeDeploymentPhase(phaseIndex, {
+        summary: "Bicep templates generated. Manual deployment required.",
+        manualDeployment: true,
+      });
+      return;
+    }
+    
+    // Check if user is logged into Azure
+    const loginCheck = await new Promise((resolve) => {
+      const p = require("child_process").spawn("az", ["account", "show"], { shell: true });
+      let output = "";
+      p.stdout?.on("data", (d) => { output += d.toString(); });
+      p.on("close", (code) => resolve({ ok: code === 0, output }));
+      p.on("error", () => resolve({ ok: false }));
+    });
+    
+    if (!loginCheck.ok) {
+      broadcastEvent(jobId, "log", { text: "\n⚠️ Not logged into Azure. Please run 'az login' first.\n" });
+      broadcastEvent(jobId, "log", { text: "📋 Bicep templates are ready in the 'infra' folder.\n" });
+      
+      await job.orchestrator.completeDeploymentPhase(phaseIndex, {
+        summary: "Bicep templates generated. Please login to Azure to deploy.",
+        manualDeployment: true,
+      });
+      return;
+    }
+    
+    broadcastEvent(jobId, "log", { text: "✅ Azure CLI authenticated\n" });
+    
+    // Get project name for resource naming
+    const projectName = path.basename(workspaceDir).replace(/_/g, "-").substring(0, 20);
+    const resourceGroup = `rg-${projectName}`;
+    const location = "eastus";
+    
+    broadcastEvent(jobId, "log", { text: `\n📦 Creating resource group: ${resourceGroup}\n` });
+    
+    // Create resource group
+    const rgResult = await new Promise((resolve) => {
+      const p = require("child_process").spawn("az", [
+        "group", "create",
+        "--name", resourceGroup,
+        "--location", location
+      ], { shell: true });
+      let output = "";
+      p.stdout?.on("data", (d) => { output += d.toString(); });
+      p.stderr?.on("data", (d) => { output += d.toString(); });
+      p.on("close", (code) => resolve({ ok: code === 0, output }));
+      p.on("error", (err) => resolve({ ok: false, output: err.message }));
+    });
+    
+    if (!rgResult.ok) {
+      broadcastEvent(jobId, "log", { text: `❌ Failed to create resource group: ${rgResult.output}\n` });
+      throw new Error("Failed to create resource group");
+    }
+    
+    broadcastEvent(jobId, "log", { text: "✅ Resource group created\n" });
+    broadcastEvent(jobId, "log", { text: `\n🚀 Deploying Bicep template...\n` });
+    
+    // Deploy Bicep template
+    const bicepPath = path.join(workspaceDir, "infra", "main.bicep");
+    if (!fs.existsSync(bicepPath)) {
+      broadcastEvent(jobId, "log", { text: `❌ Bicep template not found at ${bicepPath}\n` });
+      throw new Error("Bicep template not found");
+    }
+    
+    const deployResult = await new Promise((resolve) => {
+      const p = require("child_process").spawn("az", [
+        "deployment", "group", "create",
+        "--resource-group", resourceGroup,
+        "--template-file", bicepPath,
+        "--query", "properties.outputs",
+        "--output", "json"
+      ], { shell: true, cwd: workspaceDir });
+      let output = "";
+      p.stdout?.on("data", (d) => { 
+        output += d.toString();
+        broadcastEvent(jobId, "log", { text: d.toString() });
+      });
+      p.stderr?.on("data", (d) => { 
+        broadcastEvent(jobId, "log", { text: d.toString() });
+      });
+      p.on("close", (code) => resolve({ ok: code === 0, output }));
+      p.on("error", (err) => resolve({ ok: false, output: err.message }));
+    });
+    
+    if (deployResult.ok) {
+      broadcastEvent(jobId, "log", { text: `\n✅ Azure deployment completed!\n` });
+      
+      // Try to parse outputs for the app URL
+      try {
+        const outputs = JSON.parse(deployResult.output);
+        if (outputs.appUrl?.value) {
+          broadcastEvent(jobId, "log", { text: `🌐 Application URL: ${outputs.appUrl.value}\n` });
+          job.azureUrl = outputs.appUrl.value;
+        }
+      } catch {
+        // Outputs parsing failed, that's ok
+      }
+      
+      broadcastEvent(jobId, "azure_deployed", {
+        resourceGroup,
+        location,
+        url: job.azureUrl,
+      });
+      
+      await job.orchestrator.completeDeploymentPhase(phaseIndex, {
+        summary: `Deployed to Azure resource group: ${resourceGroup}`,
+        resourceGroup,
+        url: job.azureUrl,
+      });
+    } else {
+      broadcastEvent(jobId, "log", { text: `\n❌ Azure deployment failed\n` });
+      throw new Error("Azure deployment failed");
+    }
+    
+  } catch (error) {
+    broadcastEvent(jobId, "log", { text: `\n❌ Error: ${error.message}\n` });
+    broadcastEvent(jobId, "phase_error", {
+      phase: eventData.phase,
+      phaseIndex,
+      error: error.message,
+    });
   }
 }
 

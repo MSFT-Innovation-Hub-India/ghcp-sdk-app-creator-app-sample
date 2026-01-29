@@ -1,15 +1,35 @@
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
+
+/**
+ * Get the full path to docker executable on Windows
+ */
+function getDockerPath() {
+  if (process.platform === "win32") {
+    try {
+      // Try to find docker in PATH
+      const result = execSync("where docker", { encoding: "utf8" });
+      const paths = result.trim().split("\n");
+      return paths[0]?.trim() || "docker";
+    } catch {
+      return "docker";
+    }
+  }
+  return "docker";
+}
+
+const dockerPath = getDockerPath();
 
 /**
  * Spawn a process and stream stdout/stderr
- * On Windows, we need shell: true to find docker in PATH, but this can mangle complex scripts.
- * We handle this by keeping scripts simple and well-quoted.
+ * For docker commands, we avoid shell mode to prevent script mangling on Windows.
  */
 function spawnStream(cmd, args, onData, options = {}) {
   return new Promise((resolve) => {
-    // Use shell on Windows to find docker in PATH
-    const useShell = process.platform === "win32";
-    const p = spawn(cmd, args, { shell: useShell, ...options });
+    // Use the full docker path to avoid needing shell mode
+    const actualCmd = cmd === "docker" ? dockerPath : cmd;
+    // Only use shell if explicitly requested
+    const useShell = options.shell ?? false;
+    const p = spawn(actualCmd, args, { shell: useShell, ...options });
     let combined = "";
 
     p.stdout?.on("data", (d) => {
@@ -100,8 +120,14 @@ export async function startAppInDocker({ workspaceHostPath, deps, startCommand, 
       .replace(/^([A-Za-z]):/, (_, letter) => `/${letter.toLowerCase()}`);
   }
 
-  // Build startup script - use semicolons for Windows shell compatibility
-  const startupScript = `set -e; python -m venv .venv 2>/dev/null || true; source .venv/bin/activate; pip install --upgrade pip -q; pip install ${deps.join(" ")} -q; echo 'Starting application on port ${port}...'; ${startCommand}`;
+  // Build startup script - simplified to avoid shell interpretation issues
+  // The script runs inside the container's bash, so we don't use || true or complex redirects
+  const startupScript = [
+    "pip install --upgrade pip -q",
+    `pip install ${deps.join(" ")} -q`,
+    `echo 'Starting application on port ${port}...'`,
+    startCommand
+  ].join(" && ");
 
   const args = [
     "run", "--rm",
