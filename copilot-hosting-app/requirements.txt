@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+pytest
+httpx
+python-jose[cryptography]
+passlib[bcrypt]
+sqlalchemy
+alembic

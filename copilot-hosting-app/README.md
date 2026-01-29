@@ -1,30 +1,52 @@
-# GitHub Copilot SDK - Python App Factory
+# GitHub Copilot SDK - Multi-Step App Generator
 
-A host application that demonstrates how to use the **GitHub Copilot SDK** to programmatically create Python applications through natural language prompts.
+A host application that demonstrates how to use the **GitHub Copilot SDK** to programmatically create applications through natural language prompts with **multi-step orchestration**.
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [What's New in v2](#whats-new-in-v2)
 - [Architecture](#architecture)
+- [Supported Archetypes](#supported-archetypes)
 - [How It Works](#how-it-works)
-- [SDK and CLI Requirements](#sdk-and-cli-requirements)
-- [Custom Tools](#custom-tools)
-- [The Agent Loop](#the-agent-loop)
-- [Workspace Management](#workspace-management)
-- [LLM and Model Configuration](#llm-and-model-configuration)
 - [Running the Application](#running-the-application)
 
 ---
 
 ## Overview
 
-This application showcases the **GitHub Copilot SDK** capabilities by building a "Python App Factory" - a web-based tool that:
+This application showcases the **GitHub Copilot SDK** capabilities by building a "Multi-Step App Generator" - a web-based tool that:
 
-1. Accepts natural language descriptions of Python applications
-2. Uses Copilot's agentic capabilities to generate complete project structures
-3. Creates files, runs tests, and provides a working application
+1. Accepts natural language descriptions + optional BRD/specification documents
+2. Offers multiple **architecture archetypes** (FastAPI, React+FastAPI, Node.js)
+3. Uses **phase-by-phase generation** with user confirmation between each step
+4. Creates files, validates code, runs tests, and deploys to Docker
 
-**Key Value Proposition**: Instead of manually using VS Code's Copilot Agent Mode or the Copilot CLI interactively, this SDK allows you to embed the same agentic code-generation capabilities into your own applications programmatically.
+**Key Value Proposition**: Instead of single-shot generation that often fails on complex specs, this approach breaks generation into manageable phases with validation and user oversight.
+
+---
+
+## What's New in v2
+
+| Feature | v1 (Single-Shot) | v2 (Multi-Step) |
+|---------|------------------|-----------------|
+| Generation | All at once | Phase by phase |
+| User Control | None | Confirm each phase |
+| Validation | Only at end | After each phase |
+| Complex Specs | Often incomplete | Manageable chunks |
+| Architecture | Hardcoded FastAPI | Multiple archetypes |
+| Pydantic | v1 syntax issues | Auto-fixed for v2 |
+
+---
+
+## Supported Archetypes
+
+| Archetype | Tech Stack | Phases |
+|-----------|------------|--------|
+| **FastAPI + SQLite** | Python, FastAPI, SQLAlchemy, pytest | Setup → Database → Schemas → Auth → CRUD → API → Tests |
+| **React + FastAPI** | React, TypeScript, Vite, FastAPI | Backend phases + Frontend phases |
+| **Node.js + Express** | Node.js, Express, SQLite, Jest | Setup → Database → Models → Auth → Routes → Tests |
+| **Custom** | AI-determined | AI proposes phases based on requirements |
 
 ---
 
@@ -32,21 +54,28 @@ This application showcases the **GitHub Copilot SDK** capabilities by building a
 
 ```mermaid
 flowchart TB
-    subgraph HostApp["HOST APPLICATION"]
+    subgraph HostApp["HOST APPLICATION v2"]
         Browser["🌐 Web Browser<br/>localhost:3000"]
-        Express["Express Server<br/>index.js<br/>SSE Streaming"]
-        SDK["GitHub Copilot SDK<br/>@github/copilot-sdk<br/>• CopilotClient<br/>• defineTool()<br/>• Session Events"]
+        Express["Express Server<br/>index_v2.js"]
         
-        subgraph CLI["COPILOT CLI (Server Mode)<br/>copilot --acp"]
-            AgentRuntime["Agent Runtime<br/>Planning, Reasoning"]
-            ToolExecutor["Tool Executor<br/>Calls custom tools"]
-            ContextMgmt["Context Management<br/>Infinite Sessions"]
+        subgraph Orchestrator["ORCHESTRATION LAYER"]
+            Phases["Phase Manager<br/>• Select archetype<br/>• Track progress<br/>• Validate output"]
+            Confirmation["User Confirmation<br/>• Propose phase<br/>• Wait for proceed<br/>• Handle skip"]
         end
         
-        Browser -->|"HTTP Request"| Express
-        Express <-->|"SSE Streaming"| Browser
-        Express --> SDK
-        SDK <-->|"JSON-RPC (stdio)"| CLI
+        SDK["GitHub Copilot SDK<br/>@github/copilot-sdk"]
+        
+        subgraph CLI["COPILOT CLI"]
+            AgentRuntime["Agent Runtime"]
+            ToolExecutor["Tool Executor"]
+        end
+        
+        Browser -->|"1. Select archetype"| Express
+        Express --> Orchestrator
+        Orchestrator -->|"2. Propose phase"| Browser
+        Browser -->|"3. Confirm"| Orchestrator
+        Orchestrator -->|"4. Generate"| SDK
+        SDK <-->|"JSON-RPC"| CLI
     end
     
     subgraph CopilotService["GITHUB COPILOT SERVICE"]

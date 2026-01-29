@@ -1,6 +1,6 @@
 {
   "name": "copilot-hosting-app",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -9,10 +9,9 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Multi-step AI-powered application generator using GitHub Copilot SDK",
   "type": "module",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.71.2",
     "@github/copilot-sdk": "^0.1.19",
     "express": "^5.2.1",
     "nanoid": "^5.1.6"
